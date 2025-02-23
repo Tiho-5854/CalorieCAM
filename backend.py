@@ -1,13 +1,20 @@
 from fastapi import FastAPI, File, UploadFile
 import requests
-from PIL import Image
 import io
+from PIL import Image
+from google.cloud import vision
+from ultralytics import YOLO
 
 app = FastAPI()
 
-# Your Edamam API credentials (replace with your own keys)
-EDAMAM_APP_ID = "your_app_id"
-EDAMAM_APP_KEY = "your_app_key"
+# Load YOLO model (download the weights if needed)
+model = YOLO("yolov8n.pt")
+
+# USDA API Credentials (Replace with your own)
+USDA_API_KEY = "GPbednp3OWf2B4YNQ4XIYnpZK6cUo6hKIvz3GTBQ"
+
+# Initialize Google Vision Client
+vision_client = vision.ImageAnnotatorClient()
 
 @app.get("/")
 def home():
@@ -15,35 +22,58 @@ def home():
 
 @app.post("/analyze")
 async def analyze_food(file: UploadFile = File(...)):
-    # Convert image file to bytes
     image_bytes = await file.read()
-    
-    # Send image to Google Vision API for food detection (implement this later)
-    detected_food = "pizza"  # Placeholder for now
 
-    # Call Edamam API to get nutrition info
+    # Detect food using Google Vision API
+    detected_food = detect_food_google_vision(image_bytes)
+
+    # If Google Vision fails, fallback to YOLO
+    if not detected_food:
+        detected_food = detect_food_yolo(image_bytes)
+
+    # Fetch nutrition data from USDA API
     nutrition_data = get_nutrition_data(detected_food)
 
-    if nutrition_data:
-        return nutrition_data
-    else:
-        return {"error": "Could not fetch nutrition data"}
+    return {
+        "food_name": detected_food,
+        "nutrition": nutrition_data
+    }
 
-# Function to get nutrition data from Edamam API
+def detect_food_google_vision(image_bytes):
+    """Detects food name using Google Vision API"""
+    image = vision.Image(content=image_bytes)
+    response = vision_client.label_detection(image=image)
+    labels = response.label_annotations
+
+    # Extract most relevant food label
+    for label in labels:
+        if "food" in label.description.lower():
+            return label.description.lower()
+    return None
+
+def detect_food_yolo(image_bytes):
+    """Detects food using YOLO model"""
+    image = Image.open(io.BytesIO(image_bytes))
+    results = model(image)
+    
+    for result in results:
+        for label in result.names.values():
+            return label.lower()  # Return first detected object
+    return "unknown food"
+
 def get_nutrition_data(food_name):
-    url = f"https://api.edamam.com/api/food-database/v2/parser?ingr={food_name}&app_id={EDAMAM_APP_ID}&app_key={EDAMAM_APP_KEY}"
+    """Fetches nutrition data from USDA API"""
+    url = f"https://api.nal.usda.gov/fdc/v1/foods/search?query={food_name}&api_key={USDA_API_KEY}"
     response = requests.get(url)
-
+    
     if response.status_code == 200:
         data = response.json()
-        nutrients = data["hints"][0]["food"]["nutrients"]
-
-        return {
-            "food_name": food_name,
-            "calories": nutrients.get("ENERC_KCAL", "N/A"),
-            "protein": nutrients.get("PROCNT", "N/A"),
-            "carbs": nutrients.get("CHOCDF", "N/A"),
-            "fat": nutrients.get("FAT", "N/A")
-        }
-    else:
-        return None
+        if "foods" in data and len(data["foods"]) > 0:
+            nutrients = data["foods"][0]["foodNutrients"]
+            return {
+                "calories": next((n["value"] for n in nutrients if n["nutrientName"] == "Energy"), "N/A"),
+                "protein": next((n["value"] for n in nutrients if n["nutrientName"] == "Protein"), "N/A"),
+                "carbs": next((n["value"] for n in nutrients if n["nutrientName"] == "Carbohydrate, by difference"), "N/A"),
+                "fat": next((n["value"] for n in nutrients if n["nutrientName"] == "Total lipid (fat)"), "N/A")
+            }
+    return None
